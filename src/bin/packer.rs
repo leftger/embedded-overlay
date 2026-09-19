@@ -5,11 +5,12 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use embedded_overlay::crc::crc32;
+use embedded_overlay::crc::{crc32, fnv1a_hash};
 use embedded_overlay::header::{OverlayHeader, VfsAssetEntry, VfsSuperblock};
 
 fn print_usage(prog: &str) {
     eprintln!("Usage:");
+    eprintln!("  {prog} auto-pack <input.elf> <output_ext_flash.bin>");
     eprintln!("  {prog} overlay <input.bin> <module_id_hex_or_dec> <output.ovl>");
     eprintln!("  {prog} vfs <asset_dir> <output.vfs>");
     eprintln!("  {prog} bundle <internal.bin> <external.bin> <target_chip> <internal_addr> <external_addr> <output.fwbundle>");
@@ -19,10 +20,12 @@ fn pack_overlay(input_path: &str, module_id_str: &str, output_path: &str) -> io:
     let module_id = if module_id_str.starts_with("0x") || module_id_str.starts_with("0X") {
         u32::from_str_radix(&module_id_str[2..], 16)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+    } else if let Ok(val) = module_id_str.parse::<u32>() {
+        val
     } else {
-        module_id_str
-            .parse::<u32>()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+        let hash = fnv1a_hash(module_id_str);
+        println!("  Automatically derived module ID for '{module_id_str}': 0x{hash:08X}");
+        hash
     };
 
     let payload = fs::read(input_path)?;
@@ -173,6 +176,132 @@ fn pack_bundle(
     Ok(())
 }
 
+fn auto_pack(elf_path: &str, output_path: &str) -> io::Result<()> {
+    use embedded_overlay::header::{OverlayDirectory, OverlayDirectoryEntry};
+    use std::process::Command;
+
+    let output = Command::new("readelf")
+        .args(["-W", "-S", elf_path])
+        .output()
+        .map_err(|e| {
+            io::Error::new(io::ErrorKind::NotFound, format!("Failed to run readelf: {e}"))
+        })?;
+
+    if !output.status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "readelf execution failed"));
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut overlays = Vec::new();
+
+    for line in text.lines() {
+        if let Some(idx) = line.find(".overlay.") {
+            let rest = &line[idx..];
+            let name_part = rest.split_whitespace().next().unwrap_or("");
+            if let Some(fn_name) = name_part.strip_prefix(".overlay.") {
+                overlays.push((name_part.to_string(), fn_name.to_string()));
+            }
+        }
+    }
+
+    if overlays.is_empty() {
+        println!("No .overlay.* sections detected in {elf_path}.");
+        return Ok(());
+    }
+
+    println!("Discovered {} overlay section(s) in {elf_path}:", overlays.len());
+
+    let mut packed_ovls = Vec::new();
+    let mut tmp_idx = 0;
+
+    for (sec_name, fn_name) in overlays {
+        let tmp_file = format!("/tmp/ovl_tmp_{}_{}.bin", std::process::id(), tmp_idx);
+        tmp_idx += 1;
+
+        let objcopy_res = Command::new("llvm-objcopy")
+            .arg(format!("--dump-section={sec_name}={tmp_file}"))
+            .arg(elf_path)
+            .status();
+
+        let dumped = match objcopy_res {
+            Ok(s) if s.success() => fs::read(&tmp_file)?,
+            _ => {
+                let fallback_res = Command::new("arm-none-eabi-objcopy")
+                    .arg(format!("--dump-section={sec_name}={tmp_file}"))
+                    .arg(elf_path)
+                    .status();
+                if fallback_res.map(|s| s.success()).unwrap_or(false) {
+                    fs::read(&tmp_file)?
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Failed to dump section {sec_name}"),
+                    ));
+                }
+            }
+        };
+        let _ = fs::remove_file(&tmp_file);
+
+        let module_id = fnv1a_hash(&fn_name);
+        let payload_crc = crc32(&dumped);
+        let header = OverlayHeader::new(
+            module_id,
+            dumped.len() as u32,
+            0,
+            0,
+            payload_crc,
+        );
+
+        let mut ovl_data = Vec::with_capacity(OverlayHeader::SIZE + dumped.len());
+        ovl_data.extend_from_slice(&header.to_bytes());
+        ovl_data.extend_from_slice(&dumped);
+
+        println!(
+            "  - {fn_name}: ID=0x{module_id:08X}, {} bytes code, CRC=0x{payload_crc:08X}",
+            dumped.len()
+        );
+        packed_ovls.push((module_id, dumped.len() as u32, ovl_data));
+    }
+
+    let entry_count = packed_ovls.len() as u16;
+    let index_offset = OverlayDirectory::SIZE as u32;
+    let entries_size = entry_count as u32 * OverlayDirectoryEntry::SIZE as u32;
+    let payload_start = index_offset + entries_size;
+
+    let mut current_offset = payload_start;
+    let mut entries = Vec::new();
+    let mut payload_bytes = Vec::new();
+
+    for (module_id, code_size, ovl_data) in packed_ovls {
+        while current_offset % 4 != 0 {
+            payload_bytes.push(0);
+            current_offset += 1;
+        }
+
+        let ovl_crc = crc32(&ovl_data);
+        entries.push(OverlayDirectoryEntry {
+            module_id,
+            flash_offset: current_offset,
+            code_size,
+            crc32: ovl_crc,
+        });
+
+        current_offset += ovl_data.len() as u32;
+        payload_bytes.extend_from_slice(&ovl_data);
+    }
+
+    let dir = OverlayDirectory::new(entry_count, index_offset, current_offset);
+    let mut out_file = File::create(output_path)?;
+    out_file.write_all(&dir.to_bytes())?;
+    for entry in entries {
+        out_file.write_all(&entry.to_bytes())?;
+    }
+    out_file.write_all(&payload_bytes)?;
+
+    println!("Generated External Flash Image: {output_path} ({current_offset} bytes)");
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -181,6 +310,13 @@ fn main() -> io::Result<()> {
     }
 
     match args[1].as_str() {
+        "auto-pack" => {
+            if args.len() != 4 {
+                eprintln!("Usage: {} auto-pack <input.elf> <output_ext_flash.bin>", args[0]);
+                std::process::exit(1);
+            }
+            auto_pack(&args[2], &args[3])
+        }
         "overlay" => {
             if args.len() != 5 {
                 eprintln!("Usage: {} overlay <input.bin> <module_id> <output.ovl>", args[0]);

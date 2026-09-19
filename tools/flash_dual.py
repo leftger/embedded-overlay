@@ -11,6 +11,7 @@ Handles:
 
 import argparse
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -19,10 +20,233 @@ import zlib
 BUNDLE_MAGIC = b"DFW1"
 BUNDLE_VERSION = 1
 
+OVERLAY_MAGIC = b"OVL1"
+OVERLAY_VERSION = 1
+
+OVERLAY_DIR_MAGIC = b"OVLD"
+OVERLAY_DIR_VERSION = 1
+
 
 def crc32_ieee(data: bytes) -> int:
     """Computes standard IEEE 802.3 CRC32."""
     return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def fnv1a_32(s: str) -> int:
+    """Computes 32-bit FNV-1a hash matching embedded-overlay::crc::fnv1a_hash."""
+    h = 0x811C9DC5
+    for b in s.encode("utf-8"):
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def extract_overlay_sections(elf_path: str) -> list[tuple[str, str]]:
+    """Discovers all .overlay.* sections in the ELF binary using readelf."""
+    cmd = ["readelf", "-W", "-S", elf_path]
+    output = subprocess.check_output(cmd, text=True)
+    sections = []
+    for line in output.splitlines():
+        match = re.search(r"\[\s*\d+\]\s+(\.overlay\.([a-zA-Z0-9_]+))\s+", line)
+        if match:
+            full_sec = match.group(1)
+            fn_name = match.group(2)
+            sections.append((full_sec, fn_name))
+    return sections
+
+
+def dump_section_bytes(elf_path: str, section_name: str) -> bytes:
+    """Dumps raw section machine code using llvm-objcopy or arm-none-eabi-objcopy."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp_name = tmp.name
+    try:
+        tools = ["llvm-objcopy", "arm-none-eabi-objcopy", "objcopy"]
+        success = False
+        for tool in tools:
+            try:
+                cmd = [tool, f"--dump-section={section_name}={tmp_name}", elf_path]
+                res = subprocess.call(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                if (
+                    res == 0
+                    and os.path.exists(tmp_name)
+                    and os.path.getsize(tmp_name) > 0
+                ):
+                    success = True
+                    break
+            except FileNotFoundError:
+                continue
+        if not success:
+            raise RuntimeError(
+                f"Failed to dump section {section_name} from {elf_path}"
+            )
+        with open(tmp_name, "rb") as f:
+            return f.read()
+    finally:
+        if os.path.exists(tmp_name):
+            os.remove(tmp_name)
+
+
+def build_overlay_container(fn_name: str, payload: bytes) -> tuple[int, bytes]:
+    """Wraps raw machine code into a 32-byte header + payload .ovl container."""
+    module_id = fnv1a_32(fn_name)
+    payload_crc = crc32_ieee(payload)
+    code_size = len(payload)
+    header_pre = struct.pack(
+        "<4sHHIIIII",
+        OVERLAY_MAGIC,
+        OVERLAY_VERSION,
+        0,  # flags
+        module_id,
+        code_size,
+        0,  # entry_offset
+        0,  # ram_target_addr
+        payload_crc,
+    )
+    header_crc = crc32_ieee(header_pre)
+    header = header_pre + struct.pack("<I", header_crc)
+    return module_id, header + payload
+
+
+def build_external_flash_image(
+    overlays: list[tuple[str, int, bytes]],
+) -> bytes:
+    """
+    Builds the complete external flash binary:
+    - 32-byte OverlayDirectory header (b"OVLD")
+    - Array of 16-byte OverlayDirectoryEntry records
+    - Sequential .ovl containers (aligned to 4 bytes)
+    """
+    entry_count = len(overlays)
+    index_offset = 32
+    entries_size = 16 * entry_count
+    payload_start_offset = index_offset + entries_size
+
+    current_offset = payload_start_offset
+    entries = []
+    payloads = bytearray()
+
+    for _fn_name, module_id, ovl_bytes in overlays:
+        while (current_offset % 4) != 0:
+            payloads.append(0)
+            current_offset += 1
+
+        code_size = len(ovl_bytes) - 32
+        ovl_crc = crc32_ieee(ovl_bytes)
+        entries.append((module_id, current_offset, code_size, ovl_crc))
+        payloads.extend(ovl_bytes)
+        current_offset += len(ovl_bytes)
+
+    total_bytes = current_offset
+
+    dir_pre = struct.pack(
+        "<4sHHII",
+        OVERLAY_DIR_MAGIC,
+        OVERLAY_DIR_VERSION,
+        entry_count,
+        index_offset,
+        total_bytes,
+    )
+    dir_crc = crc32_ieee(dir_pre[:16])
+    dir_header = struct.pack(
+        "<4sHHIII12s",
+        OVERLAY_DIR_MAGIC,
+        OVERLAY_DIR_VERSION,
+        entry_count,
+        index_offset,
+        total_bytes,
+        dir_crc,
+        b"\x00" * 12,
+    )
+
+    entries_bytes = bytearray()
+    for mod_id, off, sz, crc in entries:
+        entries_bytes.extend(struct.pack("<IIII", mod_id, off, sz, crc))
+
+    return dir_header + entries_bytes + payloads
+
+
+def auto_run(
+    elf_path: str,
+    chip: str = "STM32WBA65RI",
+    protocol: str = "swd",
+    dry_run: bool = False,
+):
+    """
+    Zero-touch automated runner:
+    1. Inspects ELF binary and extracts all .overlay.* sections.
+    2. Derives FNV-1a IDs and packs .ovl containers + OverlayDirectory into external flash image.
+    3. Emits .fwbundle container.
+    4. Runs probe-rs run to download and stream defmt/RTT logs.
+    """
+    print(f"[*] embedded-overlay Auto-Runner: Inspecting {elf_path}")
+    if not os.path.isfile(elf_path):
+        print(f"[-] Error: ELF file not found: {elf_path}")
+        sys.exit(1)
+
+    sections = extract_overlay_sections(elf_path)
+    elf_dir = os.path.dirname(os.path.abspath(elf_path))
+    ext_flash_path = os.path.join(elf_dir, "ext_flash.bin")
+    bundle_path = os.path.join(elf_dir, "firmware.fwbundle")
+
+    if not sections:
+        print("[*] No .overlay.* sections detected in ELF. Standard binary detected.")
+    else:
+        print(f"[+] Discovered {len(sections)} code overlay(s) in ELF:")
+        packed_overlays = []
+        for full_sec, fn_name in sections:
+            payload = dump_section_bytes(elf_path, full_sec)
+            mod_id, ovl_bytes = build_overlay_container(fn_name, payload)
+            packed_overlays.append((fn_name, mod_id, ovl_bytes))
+            print(
+                f"    - {fn_name}: ID=0x{mod_id:08X}, {len(payload)} bytes code, CRC=0x{crc32_ieee(payload):08X}"
+            )
+
+        ext_flash_data = build_external_flash_image(packed_overlays)
+        with open(ext_flash_path, "wb") as f:
+            f.write(ext_flash_data)
+        print(
+            f"[+] Generated External Flash Image -> {ext_flash_path} ({len(ext_flash_data)} bytes)"
+        )
+
+        # Convert ELF to raw internal bin for firmware bundle if needed
+        tmp_internal_bin = os.path.join(elf_dir, "internal_app.bin")
+        try:
+            subprocess.call(
+                ["llvm-objcopy", "-O", "binary", elf_path, tmp_internal_bin],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if os.path.exists(tmp_internal_bin):
+                pack_firmware_bundle(
+                    internal_bin_path=tmp_internal_bin,
+                    external_bin_path=ext_flash_path,
+                    output_bundle_path=bundle_path,
+                    target_chip=chip,
+                )
+                os.remove(tmp_internal_bin)
+        except Exception as e:
+            print(f"[-] Note: Bundle packaging skipped ({e})")
+
+    if dry_run:
+        print("[+] Dry-run completed. All overlays extracted and packaged successfully!")
+        return
+
+    # Execute target runner (probe-rs run)
+    cmd = ["probe-rs", "run", "--chip", chip, "--protocol", protocol, elf_path]
+    print(f"[*] Executing target: {' '.join(cmd)}")
+    sys.stdout.flush()
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError as e:
+        sys.exit(e.returncode)
+    except FileNotFoundError:
+        print("[-] probe-rs not found on PATH. Install via: cargo install probe-rs-tools")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        pass
 
 
 def create_bundle_header(
@@ -174,9 +398,25 @@ def main():
     flash_ext_p.add_argument("--baud", type=int, default=115200, help="Baud rate")
     flash_ext_p.add_argument("binary", help="External flash binary to write")
 
+    # Subcommand: auto-run (Cargo runner interface)
+    auto_p = subparsers.add_parser(
+        "auto-run",
+        help="Zero-touch automated runner for 'cargo run': extracts overlays, builds external flash image, and runs target",
+    )
+    auto_p.add_argument("binary", help="Target ELF binary produced by cargo")
+    auto_p.add_argument("--chip", default="STM32WBA65RI", help="Target chip name")
+    auto_p.add_argument(
+        "--protocol", default="swd", help="Probe protocol (default: swd)"
+    )
+    auto_p.add_argument(
+        "--dry-run", action="store_true", help="Extract and pack without flashing hardware"
+    )
+
     args = parser.parse_args()
 
-    if args.command == "pack":
+    if args.command == "auto-run":
+        auto_run(args.binary, args.chip, args.protocol, args.dry_run)
+    elif args.command == "pack":
         in_addr = int(args.internal_addr, 0)
         ext_addr = int(args.external_addr, 0)
         pack_firmware_bundle(
@@ -190,3 +430,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

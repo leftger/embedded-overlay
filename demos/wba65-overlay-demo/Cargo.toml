@@ -11,7 +11,7 @@ embassy-stm32 = { path = "../../../../embassy-project/embassy/embassy-stm32", fe
 embassy-executor = { path = "../../../../embassy-project/embassy/embassy-executor", features = ["platform-cortex-m", "executor-thread", "defmt"] }
 embassy-time = { path = "../../../../embassy-project/embassy/embassy-time", features = ["defmt", "defmt-timestamp-uptime"] }
 embassy-sync = { path = "../../../../embassy-project/embassy/embassy-sync", features = ["defmt"] }
-embedded-overlay = { path = "../..", features = ["cortex-m", "defmt"] }
+embedded-overlay = { path = "../..", features = ["cortex-m", "defmt", "embassy"] }
 sequential-storage = "8.0.1"
 
 cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }

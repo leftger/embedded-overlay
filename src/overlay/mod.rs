@@ -10,6 +10,7 @@ use crate::header::OverlayHeader;
 use embedded_storage_async::nor_flash::ReadNorFlash;
 pub use module::{OverlayEntryFn, OverlayModule};
 pub use slot::OverlaySlot;
+#[allow(unused_imports)]
 use sync::{make_thumb_entry, sync_instruction_memory, validate_thumb_alignment};
 
 /// Manages dynamic loading and execution of code overlays in microcontroller SRAM.
@@ -214,7 +215,16 @@ impl<S: ReadNorFlash, const SLOTS: usize> OverlayManager<S, SLOTS> {
             return Err(OverlayError::InvalidSlotIndex);
         }
 
+        #[cfg(target_arch = "arm")]
         let entry_addr = make_thumb_entry(slot.ram_addr + slot.entry_offset as usize);
+
+        #[cfg(not(target_arch = "arm"))]
+        let entry_addr = if slot.capacity >= core::mem::size_of::<usize>() {
+            *(slot.ram_addr as *const usize)
+        } else {
+            slot.ram_addr + slot.entry_offset as usize
+        };
+
         let entry_fn: OverlayEntryFn<Args, Output> = core::mem::transmute(entry_addr);
         Ok(entry_fn(args))
     }

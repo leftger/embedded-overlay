@@ -243,3 +243,121 @@ impl VfsAssetEntry {
         }
     }
 }
+
+/// Magic bytes for Overlay Directory: "OVLD".
+pub const OVERLAY_DIR_MAGIC: [u8; 4] = *b"OVLD";
+/// Format version for Overlay Directory.
+pub const OVERLAY_DIR_VERSION: u16 = 1;
+
+/// 32-byte directory header placed at the beginning of an overlay partition or table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(4))]
+pub struct OverlayDirectory {
+    pub magic: [u8; 4],
+    pub version: u16,
+    pub entry_count: u16,
+    pub index_offset: u32,
+    pub total_bytes: u32,
+    pub crc32: u32,
+    pub reserved: [u32; 3],
+}
+
+impl OverlayDirectory {
+    pub const SIZE: usize = core::mem::size_of::<Self>(); // 32 bytes
+
+    pub fn new(entry_count: u16, index_offset: u32, total_bytes: u32) -> Self {
+        let mut dir = Self {
+            magic: OVERLAY_DIR_MAGIC,
+            version: OVERLAY_DIR_VERSION,
+            entry_count,
+            index_offset,
+            total_bytes,
+            crc32: 0,
+            reserved: [0; 3],
+        };
+        let bytes = dir.to_bytes();
+        dir.crc32 = crc32(&bytes[..16]);
+        dir
+    }
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..4].copy_from_slice(&self.magic);
+        buf[4..6].copy_from_slice(&self.version.to_le_bytes());
+        buf[6..8].copy_from_slice(&self.entry_count.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.index_offset.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.total_bytes.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.crc32.to_le_bytes());
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, OverlayError> {
+        if bytes.len() < Self::SIZE {
+            return Err(OverlayError::Storage);
+        }
+        let magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        if magic != OVERLAY_DIR_MAGIC {
+            return Err(OverlayError::InvalidMagic);
+        }
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version != OVERLAY_DIR_VERSION {
+            return Err(OverlayError::UnsupportedVersion);
+        }
+        let entry_count = u16::from_le_bytes([bytes[6], bytes[7]]);
+        let index_offset = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let total_bytes = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        let stored_crc = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+
+        let calculated_crc = crc32(&bytes[..16]);
+        if calculated_crc != stored_crc {
+            return Err(OverlayError::HeaderChecksumMismatch);
+        }
+
+        Ok(Self {
+            magic,
+            version,
+            entry_count,
+            index_offset,
+            total_bytes,
+            crc32: stored_crc,
+            reserved: [0; 3],
+        })
+    }
+}
+
+/// 16-byte Overlay Directory entry record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(4))]
+pub struct OverlayDirectoryEntry {
+    pub module_id: u32,
+    pub flash_offset: u32,
+    pub code_size: u32,
+    pub crc32: u32,
+}
+
+impl OverlayDirectoryEntry {
+    pub const SIZE: usize = core::mem::size_of::<Self>(); // 16 bytes
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        buf[0..4].copy_from_slice(&self.module_id.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.flash_offset.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.code_size.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.crc32.to_le_bytes());
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let module_id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let flash_offset = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let code_size = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let crc32 = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        Self {
+            module_id,
+            flash_offset,
+            code_size,
+            crc32,
+        }
+    }
+}
+

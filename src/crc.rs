@@ -37,6 +37,21 @@ pub fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Computes a 32-bit FNV-1a hash of a string at compile time.
+///
+/// Used for automatic, collision-resistant module ID generation from function names.
+pub const fn fnv1a_hash(s: &str) -> u32 {
+    let mut hash = 0x811c_9dc5u32;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+        i += 1;
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,5 +60,13 @@ mod tests {
     fn test_crc32_standard() {
         assert_eq!(crc32(b"123456789"), 0xCBF43926);
         assert_eq!(crc32(b""), 0x00000000);
+    }
+
+    #[test]
+    fn test_fnv1a_hash() {
+        assert_ne!(fnv1a_hash("compute_physics"), 0);
+        assert_ne!(fnv1a_hash("compute_physics"), fnv1a_hash("render_frame"));
+        // Deterministic check
+        assert_eq!(fnv1a_hash("test"), 0xAFD0_71E5);
     }
 }
