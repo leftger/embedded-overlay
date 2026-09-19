@@ -1,0 +1,7 @@
+/target
+**/target
+**/*.bin
+**/*.ovl
+**/*.vfs
+**/*.fwbundle
+.DS_Store
