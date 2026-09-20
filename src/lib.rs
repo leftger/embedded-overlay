@@ -64,7 +64,10 @@ pub use embassy_sync;
 #[macro_use]
 pub mod macros;
 
-#[cfg(feature = "build")]
+// The linker-script generator is host-side tooling (it runs in an application's `build.rs` and
+// uses `std`), so it is not compiled for bare-metal targets. That keeps `--all-features`
+// buildable for the Cortex-M targets in `package.metadata.docs.rs`.
+#[cfg(all(feature = "build", not(target_os = "none")))]
 pub mod build;
 
 #[cfg(feature = "embassy")]
@@ -75,7 +78,9 @@ pub use bundle::BundleHeader;
 pub use crc::{crc32, fnv1a_hash};
 pub use error::{OverlayError, VfsError};
 pub use header::{OverlayHeader, VfsAssetEntry, VfsSuperblock};
-pub use overlay::{OverlayEntryFn, OverlayManager, OverlayModule, OverlaySlot};
+pub use overlay::{InstructionCacheSync, OverlayEntryFn, OverlayManager, OverlayModule, OverlaySlot};
+#[cfg(all(feature = "cortex-m", target_arch = "arm", target_has_atomic = "ptr"))]
+pub use overlay::CoreIcacheSync;
 pub use partition::{PartitionError, PartitionView};
 pub use vfs::{LruSectorCache, VfsReader};
 

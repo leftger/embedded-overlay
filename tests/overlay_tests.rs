@@ -1,7 +1,7 @@
 use embedded_overlay::crc::crc32;
 use embedded_overlay::header::OverlayHeader;
 use embedded_overlay::mock::MockFlash;
-use embedded_overlay::overlay::{OverlayManager, OverlayModule, OverlaySlot};
+use embedded_overlay::overlay::{InstructionCacheSync, OverlayManager, OverlayModule, OverlaySlot};
 use embedded_overlay::OverlayError;
 
 // Minimal zero-dependency async executor for host unit tests
@@ -217,5 +217,74 @@ fn test_overlay_slot_pinning() {
         assert!(manager.is_resident(AddModule::MODULE_ID)); // Slot 0 protected!
         assert!(manager.is_resident(HeavyModule::MODULE_ID));
         assert!(!manager.is_resident(MulModule::MODULE_ID));
+    });
+}
+
+/// Instruction-synchronization hook that counts how often the engine invokes it.
+struct CountingSync {
+    calls: u32,
+}
+
+impl InstructionCacheSync for CountingSync {
+    fn code_loaded(&mut self) {
+        self.calls += 1;
+    }
+}
+
+#[test]
+fn test_instruction_sync_hook_invoked_once_per_load() {
+    block_on(async {
+        let mut flash = MockFlash::<65536>::new();
+        write_overlay_to_flash(&mut flash, 0, AddModule::MODULE_ID, add_numbers);
+        write_overlay_to_flash(&mut flash, 256, MulModule::MODULE_ID, multiply_numbers);
+
+        static mut RAM_SLOT_A: AlignedBuffer<64> = AlignedBuffer([0; 64]);
+        static mut RAM_SLOT_B: AlignedBuffer<64> = AlignedBuffer([0; 64]);
+
+        let slots = [
+            OverlaySlot::from_static_slice(unsafe { &mut *core::ptr::addr_of_mut!(RAM_SLOT_A.0) }),
+            OverlaySlot::from_static_slice(unsafe { &mut *core::ptr::addr_of_mut!(RAM_SLOT_B.0) }),
+        ];
+
+        let mut manager =
+            OverlayManager::<_, 2, _>::with_sync(flash, slots, CountingSync { calls: 0 });
+        assert_eq!(manager.sync().calls, 0);
+
+        // First load must synchronize exactly once.
+        manager.ensure_resident_typed::<AddModule>(0).await.unwrap();
+        assert_eq!(manager.sync().calls, 1);
+
+        // A resident module is not reloaded, so no further synchronization must happen.
+        manager.ensure_resident_typed::<AddModule>(0).await.unwrap();
+        assert_eq!(manager.sync().calls, 1);
+
+        // Loading a different module synchronizes again.
+        manager.ensure_resident_typed::<MulModule>(256).await.unwrap();
+        assert_eq!(manager.sync().calls, 2);
+    });
+}
+
+#[test]
+fn test_exec_addr_is_validated_not_ram_addr() {
+    block_on(async {
+        let mut flash = MockFlash::<65536>::new();
+        write_overlay_to_flash(&mut flash, 0, AddModule::MODULE_ID, add_numbers);
+
+        static mut RAM_SLOT: AlignedBuffer<64> = AlignedBuffer([0; 64]);
+
+        // Execution through a misaligned alias must be rejected even though the physical SRAM
+        // address itself is 16-byte aligned.
+        let slot = OverlaySlot::from_static_slice(unsafe {
+            &mut *core::ptr::addr_of_mut!(RAM_SLOT.0)
+        })
+        .with_exec_addr(0x1000_0002);
+
+        let mut manager = OverlayManager::<_, 1>::new(flash, [slot]);
+        let result = manager.ensure_resident_typed::<AddModule>(0).await;
+        assert!(
+            matches!(result, Err(OverlayError::InvalidAlignment)),
+            "expected InvalidAlignment, got {:?}",
+            result
+        );
     });
 }

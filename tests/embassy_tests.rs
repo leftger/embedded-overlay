@@ -194,7 +194,7 @@ fn test_embassy_overlay_engine_transparent_dispatch() {
         assert!(engine.is_resident::<VectorMultKernel>().await);
 
         // Pipelining / prefetch helper:
-        let _sum_pipelined = call_and_prefetch::<VectorAddKernel, VectorMultKernel, _, _, 2, 16>(
+        let _sum_pipelined = call_and_prefetch::<VectorAddKernel, VectorMultKernel, _, _, 2, 16, _>(
             &engine,
             VectorArgs { x: 50, y: 50 },
         )

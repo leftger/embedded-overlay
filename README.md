@@ -233,9 +233,9 @@ Execute compute kernels in Slot A while asynchronously streaming the next module
 use embedded_overlay::embassy::call_and_prefetch;
 
 // Executes ModuleA in Slot A and automatically triggers background prefetch of ModuleB into Slot B
-let result_a = call_and_prefetch::<ModuleA, ModuleB, _, _, 2, 16>(&engine, input_a).await.unwrap();
+let result_a = call_and_prefetch::<ModuleA, ModuleB, _, _, 2, 16, _>(&engine, input_a).await.unwrap();
 
-// Immediate switchover to Slot B with zero load delay:
+// Switchover to the already-prefetched Slot B:
 let result_b = engine.call::<ModuleB>(input_b).await.unwrap();
 ```
 
@@ -326,6 +326,53 @@ let result = overlay_mgr.call_typed::<PhysicsEngine>(slot_idx, current_state).un
 
 ---
 
+### 9. Instruction-Cache Coherency (Cortex-M7 / STM32 ICACHE)
+
+After machine code is written into a RAM slot, the core must observe it before it is executed. `OverlayManager` performs this through the [`InstructionCacheSync`](file:///home/usuario/Projects/my-repos/embedded-overlay/src/overlay/sync.rs) hook, which is invoked exactly once per slot load:
+
+* The default (used by `OverlayManager::new`) issues `DSB` + `ISB`. This is correct for cores with no cache in front of the code bus (Cortex-M0/M0+/M3/M4).
+* `DSB`/`ISB` do **not** invalidate a hardware instruction cache. Two common cases:
+
+**Cortex-M7 (core I-cache)** — use the built-in [`CoreIcacheSync`](file:///home/usuario/Projects/my-repos/embedded-overlay/src/overlay/sync.rs), available with the `cortex-m` feature on Armv7-M/Armv8-M targets. It runs `DSB` -> `SCB::ICIALLU` -> `DSB` -> `ISB`:
+
+```rust
+use embedded_overlay::{CoreIcacheSync, OverlayManager};
+
+let manager = OverlayManager::<_, 2, _>::with_sync(flash, slots, CoreIcacheSync);
+```
+
+**STM32 ICACHE block (WBA/U5/H5/U3)** — the register-level driver lives in the HAL; implement the hook on top of it:
+
+```rust
+use embedded_overlay::InstructionCacheSync;
+
+struct IcacheSync {
+    icache: embassy_stm32::icache::Icache<'static>,
+}
+
+impl InstructionCacheSync for IcacheSync {
+    fn code_loaded(&mut self) {
+        cortex_m::asm::dsb();
+        // Full-cache CACHEINV. DSB/ISB alone cannot invalidate the ICACHE block.
+        self.icache.invalidate();
+        cortex_m::asm::isb();
+    }
+}
+
+let mut engine =
+    EmbassyOverlayEngine::<CriticalSectionRawMutex, _, 2, 16, IcacheSync>::with_sync(
+        bus.handle(),
+        slots,
+        IcacheSync { icache },
+    );
+```
+
+> If the Cortex-M7 **D-cache** is enabled and the slot was filled by CPU stores rather than DMA, clean the D-cache for the written range first, or map the slot region as non-cacheable in the MPU.
+
+To fetch overlay code *through* the cache, configure the HAL's ICACHE remap (a code-region alias window) and point the slot's execution address at that alias with [`OverlaySlot::with_exec_addr`](file:///home/usuario/Projects/my-repos/embedded-overlay/src/overlay/slot.rs), while code is still written to its physical SRAM address. Without a remap, SRAM is fetched over the system bus and no cache maintenance is required. A complete reference is in [`demos/wba65-overlay-demo`](file:///home/usuario/Projects/my-repos/embedded-overlay/demos/wba65-overlay-demo/src/main.rs).
+
+---
+
 ## Interoperability with Operating Systems
 
 ### Ariel OS
@@ -346,9 +393,16 @@ Full native integration is provided via `features = ["embassy"]`. All drivers an
 | Feature | Description | Default |
 |---|---|---|
 | `embassy` | Enables [`EmbassyOverlayEngine`](file:///home/usuario/Projects/my-repos/embedded-overlay/src/embassy/engine.rs), [`SharedStorageBus`](file:///home/usuario/Projects/my-repos/embedded-overlay/src/embassy/shared_storage.rs), [`define_overlay_slots!`](file:///home/usuario/Projects/my-repos/embedded-overlay/src/embassy/slots.rs), and transparent dispatch | No |
-| `cortex-m` | Enables hardware `DSB` and `ISB` instruction cache synchronization via `cortex-m` | No |
+| `cortex-m` | Enables `cortex-m` barriers (`DSB`/`ISB`) for instruction synchronization. This is *not* an instruction-cache invalidate; on Cortex-M7 or STM32 ICACHE parts, supply an [`InstructionCacheSync`](file:///home/usuario/Projects/my-repos/embedded-overlay/src/overlay/sync.rs) implementation via `OverlayManager::with_sync` / `EmbassyOverlayEngine::with_sync` | No |
 | `defmt` | Enables formatting implementations for `defmt` logging | No |
+| `portable-atomics` | Enables atomic compare-and-swap on targets without native CAS (Cortex-M0/M0+, `thumbv6m-none-eabi`) via `portable-atomic`'s `critical-section` fallback. Required when using `embassy` on `thumbv6m`, since `static_cell` needs CAS | No |
 | `std` | Enables standard library support and host `overlay-packer` CLI | No |
+
+> **Cortex-M0/M0+ (`thumbv6m-none-eabi`):** the target has no atomic CAS, which the `embassy` feature's `static_cell` dependency requires. Enable `portable-atomics` alongside `embassy`:
+> ```toml
+> embedded-overlay = { version = "0.1", features = ["embassy", "portable-atomics"] }
+> ```
+> This makes `portable-atomic` use critical sections for CAS, so you must also provide a `critical-section` implementation (e.g. `cortex-m`'s `critical-section-single-core` feature), which an Embassy Cortex-M0 application needs anyway.
 
 ---
 

@@ -98,8 +98,14 @@ macro_rules! memory_overlay {
             static _KEEP_ENTRY: unsafe extern "C" fn(Args) -> $ret_type = entry_point;
 
             /// Call this overlay via an [`EmbassyOverlayEngine`](crate::embassy::EmbassyOverlayEngine).
-            pub async fn call<M, S, const SLOTS: usize, const MAX_MODULES: usize>(
-                engine: &$crate::embassy::EmbassyOverlayEngine<M, S, SLOTS, MAX_MODULES>,
+            pub async fn call<
+                M,
+                S,
+                const SLOTS: usize,
+                const MAX_MODULES: usize,
+                B: $crate::overlay::InstructionCacheSync,
+            >(
+                engine: &$crate::embassy::EmbassyOverlayEngine<M, S, SLOTS, MAX_MODULES, B>,
                 $($arg_name: $arg_type),*
             ) -> Result<$ret_type, $crate::error::OverlayError>
             where
@@ -114,8 +120,14 @@ macro_rules! memory_overlay {
         // Direct async callable function in the current scope
         $(#[$meta])*
         #[inline(always)]
-        $vis async fn $fn_name<M, S, const SLOTS: usize, const MAX_MODULES: usize>(
-            engine: &$crate::embassy::EmbassyOverlayEngine<M, S, SLOTS, MAX_MODULES>,
+        $vis async fn $fn_name<
+            M,
+            S,
+            const SLOTS: usize,
+            const MAX_MODULES: usize,
+            B: $crate::overlay::InstructionCacheSync,
+        >(
+            engine: &$crate::embassy::EmbassyOverlayEngine<M, S, SLOTS, MAX_MODULES, B>,
             $($arg_name: $arg_type),*
         ) -> Result<$ret_type, $crate::error::OverlayError>
         where

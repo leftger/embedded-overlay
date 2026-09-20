@@ -19,11 +19,20 @@ defmt = ["dep:defmt"]
 cortex-m = ["dep:cortex-m"]
 embassy = ["dep:embassy-sync", "dep:embassy-futures", "dep:static_cell"]
 build = ["std"]
+# Enables atomic compare-and-swap on targets that lack it natively (Cortex-M0/M0+, i.e.
+# `thumbv6m-none-eabi`) by turning on `portable-atomic`'s critical-section fallback. Required
+# when the `embassy` feature is used on thumbv6m, since `static_cell` needs atomic CAS. On
+# targets with native CAS the generated code is unchanged, but the `critical-section`
+# dependency is still pulled in.
+portable-atomics = ["dep:portable-atomic"]
 
 [[bin]]
 name = "overlay-packer"
 path = "src/bin/packer.rs"
 required-features = ["std"]
+# Host-only CLI: it uses `std`, so it cannot be built for bare-metal targets. Excluding it from
+# doc generation keeps `--all-features` working for the Cortex-M targets in `package.metadata.docs.rs`.
+doc = false
 
 [dependencies]
 embedded-storage = "0.3.1"
@@ -33,6 +42,10 @@ cortex-m = { version = "0.7.7", optional = true }
 embassy-sync = { version = "0.8.0", optional = true }
 embassy-futures = { version = "0.1.2", optional = true }
 static_cell = { version = "2.1.1", optional = true }
+# Only used through feature unification: `static_cell` depends on `portable-atomic`, and
+# enabling its `critical-section` fallback is what supplies CAS on `thumbv6m`. This crate never
+# calls it directly.
+portable-atomic = { version = "1", optional = true, features = ["critical-section"] }
 
 [dev-dependencies]
 sequential-storage = "8.0.1"

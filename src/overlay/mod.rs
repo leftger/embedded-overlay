@@ -10,24 +10,60 @@ use crate::header::OverlayHeader;
 use embedded_storage_async::nor_flash::ReadNorFlash;
 pub use module::{OverlayEntryFn, OverlayModule};
 pub use slot::OverlaySlot;
+pub use sync::InstructionCacheSync;
+#[cfg(all(feature = "cortex-m", target_arch = "arm", target_has_atomic = "ptr"))]
+pub use sync::CoreIcacheSync;
 #[allow(unused_imports)]
-use sync::{make_thumb_entry, sync_instruction_memory, validate_thumb_alignment};
+use sync::{make_thumb_entry, validate_thumb_alignment};
 
 /// Manages dynamic loading and execution of code overlays in microcontroller SRAM.
-pub struct OverlayManager<S, const SLOTS: usize> {
+pub struct OverlayManager<S, const SLOTS: usize, B = ()> {
     storage: S,
     slots: [OverlaySlot; SLOTS],
     lru_counter: u64,
+    sync: B,
 }
 
-impl<S: ReadNorFlash, const SLOTS: usize> OverlayManager<S, SLOTS> {
-    /// Creates a new OverlayManager.
+impl<S: ReadNorFlash, const SLOTS: usize> OverlayManager<S, SLOTS, ()> {
+    /// Creates a new `OverlayManager` using barrier-only instruction synchronization
+    /// ([`InstructionCacheSync`] is implemented for `()`).
+    ///
+    /// On targets whose code bus has a hardware instruction cache (Cortex-M7, or STM32 parts with
+    /// the ICACHE block), use [`OverlayManager::with_sync`] so the required cache maintenance runs
+    /// after each load.
     pub fn new(storage: S, slots: [OverlaySlot; SLOTS]) -> Self {
         Self {
             storage,
             slots,
             lru_counter: 0,
+            sync: (),
         }
+    }
+}
+
+impl<S: ReadNorFlash, const SLOTS: usize, B: InstructionCacheSync> OverlayManager<S, SLOTS, B> {
+    /// Creates a new `OverlayManager` with a caller-provided instruction synchronization hook.
+    ///
+    /// The hook's [`code_loaded`](InstructionCacheSync::code_loaded) method is invoked once after
+    /// each module is streamed into a slot and verified, immediately before the slot is marked
+    /// resident.
+    pub fn with_sync(storage: S, slots: [OverlaySlot; SLOTS], sync: B) -> Self {
+        Self {
+            storage,
+            slots,
+            lru_counter: 0,
+            sync,
+        }
+    }
+
+    /// Returns a reference to the instruction synchronization hook.
+    pub fn sync(&self) -> &B {
+        &self.sync
+    }
+
+    /// Returns mutable access to the instruction synchronization hook.
+    pub fn sync_mut(&mut self) -> &mut B {
+        &mut self.sync
     }
 
     /// Access the underlying storage driver.
@@ -120,7 +156,7 @@ impl<S: ReadNorFlash, const SLOTS: usize> OverlayManager<S, SLOTS> {
     /// 2. Selects an available or LRU RAM slot.
     /// 3. Streams the machine code into the RAM buffer asynchronously.
     /// 4. Verifies the IEEE 802.3 CRC32 checksum.
-    /// 5. Executes Cortex-M DSB and ISB pipeline synchronization.
+    /// 5. Synchronizes instruction fetch via the [`InstructionCacheSync`] hook.
     ///
     /// Returns the slot index containing the resident module.
     pub async fn ensure_resident(
@@ -158,7 +194,7 @@ impl<S: ReadNorFlash, const SLOTS: usize> OverlayManager<S, SLOTS> {
         }
 
         // Validate alignment for ARM Cortex-M
-        if !validate_thumb_alignment(slot.ram_addr, header.entry_offset as usize) {
+        if !validate_thumb_alignment(slot.exec_addr, header.entry_offset as usize) {
             return Err(OverlayError::InvalidAlignment);
         }
 
@@ -180,8 +216,9 @@ impl<S: ReadNorFlash, const SLOTS: usize> OverlayManager<S, SLOTS> {
             });
         }
 
-        // Execute processor instruction cache and pipeline synchronization
-        sync_instruction_memory();
+        // Synchronize instruction fetch with the freshly written code. On parts with a hardware
+        // instruction cache, the hook performs the cache maintenance that DSB/ISB alone cannot.
+        self.sync.code_loaded();
 
         let next_gen = self.next_generation();
         let slot = &mut self.slots[slot_idx];
@@ -216,13 +253,13 @@ impl<S: ReadNorFlash, const SLOTS: usize> OverlayManager<S, SLOTS> {
         }
 
         #[cfg(target_arch = "arm")]
-        let entry_addr = make_thumb_entry(slot.ram_addr + slot.entry_offset as usize);
+        let entry_addr = make_thumb_entry(slot.exec_addr + slot.entry_offset as usize);
 
         #[cfg(not(target_arch = "arm"))]
         let entry_addr = if slot.capacity >= core::mem::size_of::<usize>() {
             *(slot.ram_addr as *const usize)
         } else {
-            slot.ram_addr + slot.entry_offset as usize
+            slot.exec_addr + slot.entry_offset as usize
         };
 
         let entry_fn: OverlayEntryFn<Args, Output> = core::mem::transmute(entry_addr);

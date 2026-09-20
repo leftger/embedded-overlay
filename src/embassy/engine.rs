@@ -5,7 +5,7 @@ use embassy_sync::mutex::Mutex;
 use embedded_storage_async::nor_flash::ReadNorFlash;
 
 use crate::error::OverlayError;
-use crate::overlay::{OverlayManager, OverlayModule, OverlaySlot};
+use crate::overlay::{InstructionCacheSync, OverlayManager, OverlayModule, OverlaySlot};
 
 /// Module registration record mapping a 32-bit module ID to its flash offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,18 +23,45 @@ pub struct ModuleRegistration {
 ///
 /// This provides transparent overlay invocation: tasks simply call `engine.call::<M>(args).await`
 /// without having to know or manage RAM slots, generations, or flash byte offsets.
-pub struct EmbassyOverlayEngine<M: RawMutex, S, const SLOTS: usize, const MAX_MODULES: usize = 16> {
-    manager: Mutex<M, OverlayManager<S, SLOTS>>,
+pub struct EmbassyOverlayEngine<
+    M: RawMutex,
+    S,
+    const SLOTS: usize,
+    const MAX_MODULES: usize = 16,
+    B = (),
+> {
+    manager: Mutex<M, OverlayManager<S, SLOTS, B>>,
     registry: [Option<ModuleRegistration>; MAX_MODULES],
 }
 
 impl<M: RawMutex, S: ReadNorFlash, const SLOTS: usize, const MAX_MODULES: usize>
-    EmbassyOverlayEngine<M, S, SLOTS, MAX_MODULES>
+    EmbassyOverlayEngine<M, S, SLOTS, MAX_MODULES, ()>
 {
-    /// Creates a new EmbassyOverlayEngine.
+    /// Creates a new `EmbassyOverlayEngine` using barrier-only instruction synchronization.
+    ///
+    /// On hardware with an instruction cache in front of the code bus, prefer
+    /// [`EmbassyOverlayEngine::with_sync`].
     pub fn new(storage: S, slots: [OverlaySlot; SLOTS]) -> Self {
         Self {
             manager: Mutex::new(OverlayManager::new(storage, slots)),
+            registry: [None; MAX_MODULES],
+        }
+    }
+}
+
+impl<
+        M: RawMutex,
+        S: ReadNorFlash,
+        const SLOTS: usize,
+        const MAX_MODULES: usize,
+        B: InstructionCacheSync,
+    > EmbassyOverlayEngine<M, S, SLOTS, MAX_MODULES, B>
+{
+    /// Creates a new `EmbassyOverlayEngine` with a caller-provided instruction-cache
+    /// synchronization hook, applied to every slot load.
+    pub fn with_sync(storage: S, slots: [OverlaySlot; SLOTS], sync: B) -> Self {
+        Self {
+            manager: Mutex::new(OverlayManager::with_sync(storage, slots, sync)),
             registry: [None; MAX_MODULES],
         }
     }
@@ -179,7 +206,7 @@ impl<M: RawMutex, S: ReadNorFlash, const SLOTS: usize, const MAX_MODULES: usize>
     /// 1. Resolves `Mod::MODULE_ID` in the registry to find its flash offset.
     /// 2. Asynchronously locks the overlay manager mutex (yielding CPU to other Embassy tasks).
     /// 3. Ensures the module is resident in RAM (streaming via DMA if not already cached).
-    /// 4. Synchronizes Thumb-2 memory barriers (`DSB`/`ISB`).
+    /// 4. Synchronizes instruction fetch through the [`InstructionCacheSync`] hook.
     /// 5. Invokes the resident module with typed arguments and returns the typed output.
     pub async fn call<Mod: OverlayModule>(
         &self,
@@ -220,7 +247,7 @@ impl<M: RawMutex, S: ReadNorFlash, const SLOTS: usize, const MAX_MODULES: usize>
     }
 
     /// Provides access to the underlying Mutex-protected [`OverlayManager`].
-    pub fn inner(&self) -> &Mutex<M, OverlayManager<S, SLOTS>> {
+    pub fn inner(&self) -> &Mutex<M, OverlayManager<S, SLOTS, B>> {
         &self.manager
     }
 }

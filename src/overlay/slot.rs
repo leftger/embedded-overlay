@@ -3,8 +3,14 @@
 /// A designated execution slot in microcontroller SRAM.
 #[derive(Debug)]
 pub struct OverlaySlot {
-    /// Physical base address in SRAM.
+    /// Physical base address in SRAM. Machine code is written here, over the system bus.
     pub ram_addr: usize,
+    /// Address the CPU branches to when executing code in this slot.
+    ///
+    /// Defaults to [`ram_addr`](Self::ram_addr). Set it to an alias address (for example an
+    /// ICACHE code-region window, see [`Self::with_exec_addr`]) when instruction fetches should
+    /// be served through an instruction cache while writes still target `ram_addr`.
+    pub exec_addr: usize,
     /// Maximum capacity of this slot in bytes.
     pub capacity: usize,
     /// Currently loaded module ID, if any.
@@ -26,6 +32,7 @@ impl OverlaySlot {
     pub const unsafe fn new_raw(ram_addr: usize, capacity: usize) -> Self {
         Self {
             ram_addr,
+            exec_addr: ram_addr,
             capacity,
             resident_module: None,
             entry_offset: 0,
@@ -40,12 +47,32 @@ impl OverlaySlot {
         let capacity = slice.len();
         Self {
             ram_addr,
+            exec_addr: ram_addr,
             capacity,
             resident_module: None,
             entry_offset: 0,
             generation: 0,
             is_pinned: false,
         }
+    }
+
+    /// Sets a distinct execution address for this slot.
+    ///
+    /// Use this when instruction fetches should go through an instruction-cache alias window while
+    /// code is still written to the physical SRAM address in [`ram_addr`](Self::ram_addr). For
+    /// example, on STM32WBA the ICACHE can remap a 2 MB-aligned SRAM region into a code-region
+    /// alias, so setting `exec_addr` to that alias routes instruction fetches through the cache.
+    ///
+    /// `ram_addr` and `exec_addr` must refer to the same physical memory: the code loaded at
+    /// `ram_addr` is what executes at `exec_addr`.
+    pub fn with_exec_addr(mut self, exec_addr: usize) -> Self {
+        self.exec_addr = exec_addr;
+        self
+    }
+
+    /// Sets the execution address in place. See [`Self::with_exec_addr`].
+    pub fn set_exec_addr(&mut self, exec_addr: usize) {
+        self.exec_addr = exec_addr;
     }
 
     /// Checks if a given module ID is currently resident in this slot.
