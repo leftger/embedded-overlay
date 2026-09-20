@@ -1,0 +1,21 @@
+[package]
+name = "overlay-packer"
+version = "0.1.0"
+edition = "2021"
+authors = ["Gerzain Mata <leftger@gmail.com>"]
+license = "MIT OR Apache-2.0"
+description = "Host CLI for packaging embedded-overlay code overlays, streamable VFS images, and dual-flash firmware bundles"
+keywords = ["embedded", "overlay", "dma", "packaging", "cli"]
+categories = ["command-line-utilities", "embedded", "no-std"]
+repository = "https://github.com/leftger/embedded-overlay"
+homepage = "https://github.com/leftger/embedded-overlay"
+
+# This is a host-only tool: it links `std` and cannot be built for the bare-metal targets that
+# the `embedded-overlay` library supports. Keeping it in its own package means the library's
+# `--all-features` builds stay valid for Cortex-M targets.
+[[bin]]
+name = "overlay-packer"
+path = "src/main.rs"
+
+[dependencies]
+embedded-overlay = { path = "..", version = "0.1.0" }

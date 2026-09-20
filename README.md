@@ -396,7 +396,7 @@ Full native integration is provided via `features = ["embassy"]`. All drivers an
 | `cortex-m` | Enables `cortex-m` barriers (`DSB`/`ISB`) for instruction synchronization. This is *not* an instruction-cache invalidate; on Cortex-M7 or STM32 ICACHE parts, supply an [`InstructionCacheSync`](file:///home/usuario/Projects/my-repos/embedded-overlay/src/overlay/sync.rs) implementation via `OverlayManager::with_sync` / `EmbassyOverlayEngine::with_sync` | No |
 | `defmt` | Enables formatting implementations for `defmt` logging | No |
 | `portable-atomics` | Enables atomic compare-and-swap on targets without native CAS (Cortex-M0/M0+, `thumbv6m-none-eabi`) via `portable-atomic`'s `critical-section` fallback. Required when using `embassy` on `thumbv6m`, since `static_cell` needs CAS | No |
-| `std` | Enables standard library support and host `overlay-packer` CLI | No |
+| `std` | Enables standard library support, required by the host-only `build` linker-script generator | No |
 
 > **Cortex-M0/M0+ (`thumbv6m-none-eabi`):** the target has no atomic CAS, which the `embassy` feature's `static_cell` dependency requires. Enable `portable-atomics` alongside `embassy`:
 > ```toml
@@ -424,21 +424,25 @@ Full native integration is provided via `features = ["embassy"]`. All drivers an
 ./tools/flash_dual.py flash-external --port /dev/ttyACM0 external.bin
 ```
 
-### 2. Rust Packaging CLI ([`overlay-packer`](file:///home/usuario/Projects/my-repos/embedded-overlay/src/bin/packer.rs))
+### 2. Rust Packaging CLI ([`overlay-packer`](file:///home/usuario/Projects/my-repos/embedded-overlay/overlay-packer/src/main.rs))
+
+`overlay-packer` is a **host-only workspace member** (`overlay-packer/`). It links `std`, so it is not part of the bare-metal library package. Run it with `-p` from the workspace root:
 
 ```bash
 # Automatically extract all .overlay.* sections from an ELF into external flash image:
-cargo run --features std --bin overlay-packer -- auto-pack target/.../my-app ext_flash.bin
+cargo run -p overlay-packer -- auto-pack target/.../my-app ext_flash.bin
 
 # Package an individual binary into an .ovl container with CRC32:
-cargo run --features std --bin overlay-packer -- overlay physics_kernel.bin 0x1001 physics.ovl
+cargo run -p overlay-packer -- overlay physics_kernel.bin 0x1001 physics.ovl
 
 # Package an asset directory into a contiguous streamable .vfs image:
-cargo run --features std --bin overlay-packer -- vfs ./assets ./assets.vfs
+cargo run -p overlay-packer -- vfs ./assets ./assets.vfs
 
 # Create a unified dual-flash firmware bundle (.fwbundle):
-cargo run --features std --bin overlay-packer -- bundle app.bin external.bin STM32WBA65RI 0x08010000 0x00000000 firmware.fwbundle
+cargo run -p overlay-packer -- bundle app.bin external.bin STM32WBA65RI 0x08010000 0x00000000 firmware.fwbundle
 ```
+
+Equivalently, `cd overlay-packer && cargo run -- <args>`.
 
 ---
 

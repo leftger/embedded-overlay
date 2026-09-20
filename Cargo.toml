@@ -26,14 +26,6 @@ build = ["std"]
 # dependency is still pulled in.
 portable-atomics = ["dep:portable-atomic"]
 
-[[bin]]
-name = "overlay-packer"
-path = "src/bin/packer.rs"
-required-features = ["std"]
-# Host-only CLI: it uses `std`, so it cannot be built for bare-metal targets. Excluding it from
-# doc generation keeps `--all-features` working for the Cortex-M targets in `package.metadata.docs.rs`.
-doc = false
-
 [dependencies]
 embedded-storage = "0.3.1"
 embedded-storage-async = "0.4.1"
@@ -61,3 +53,10 @@ targets = [
     "thumbv8m.main-none-eabihf",
     "x86_64-unknown-linux-gnu",
 ]
+
+[workspace]
+members = ["overlay-packer"]
+# Standalone embedded packages that are built on their own (each has its own Cargo.lock and
+# target hardware). They depend on this crate by path, so they must be kept out of the workspace.
+exclude = ["bootloader", "demos/wba65-overlay-demo"]
+resolver = "2"
